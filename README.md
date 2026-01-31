@@ -7,12 +7,13 @@ A lightweight, transparent security scanner that runs **locally in your environm
 ```bash
 # Download the scanner
 curl -sL https://raw.githubusercontent.com/Starlings-Data/aws-scanner/main/starlings-aws-scan.sh -o starlings-aws-scan.sh
-
-# Make it executable
 chmod +x starlings-aws-scan.sh
 
-# Run the scan
+# Run the scan (default credentials)
 ./starlings-aws-scan.sh
+
+# For AWS SSO users - specify your profile
+./starlings-aws-scan.sh --profile YOUR_SSO_PROFILE
 ```
 
 ## Requirements
