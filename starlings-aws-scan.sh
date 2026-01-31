@@ -129,10 +129,13 @@ check_prerequisites() {
         print_status "Using profile: $PROFILE"
     fi
     
-    # Check AWS credentials with better error handling
+    # Check AWS credentials
     local cred_check
+    local cred_exit
+    set +e
     cred_check=$(aws sts get-caller-identity $PROFILE_ARG 2>&1)
-    local cred_exit=$?
+    cred_exit=$?
+    set -e
     
     if [ $cred_exit -ne 0 ]; then
         print_error "AWS credentials not configured or invalid."
