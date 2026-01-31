@@ -27,8 +27,14 @@ chmod +x starlings-aws-scan.sh
 # Scan default region (from AWS CLI config)
 ./starlings-aws-scan.sh
 
+# Scan using an SSO or named profile
+./starlings-aws-scan.sh --profile my-sso-profile
+
 # Scan specific region
 ./starlings-aws-scan.sh --region us-west-2
+
+# Combine profile and region
+./starlings-aws-scan.sh --profile prod-admin --region us-east-1
 
 # Custom output file
 ./starlings-aws-scan.sh --output my-report.json
@@ -38,6 +44,18 @@ chmod +x starlings-aws-scan.sh
 
 # Show help
 ./starlings-aws-scan.sh --help
+```
+
+### Using with AWS SSO
+
+If you use AWS SSO (IAM Identity Center), first login then run with your profile:
+
+```bash
+# Login to SSO
+aws sso login --profile my-sso-profile
+
+# Run scan with that profile
+./starlings-aws-scan.sh --profile my-sso-profile
 ```
 
 ## What It Checks
@@ -229,6 +247,11 @@ The scanner automatically redacts:
 - ✅ **Auto-redacts** - Sensitive data removed from output
 
 ## Changelog
+
+### v1.1.1
+- Added `--profile` flag for AWS SSO and named profile support
+- Improved credential error messages with specific troubleshooting guidance
+- Better handling of expired tokens and invalid credentials
 
 ### v1.1.0
 - Added 12+ new security checks
