@@ -12,6 +12,7 @@
         "iam:ListAccessKeys",
         "iam:GetAccessKeyLastUsed",
         "iam:GetUser",
+        "iam:GetRole",
         "iam:ListAttachedUserPolicies",
         "iam:GenerateCredentialReport",
         "iam:GetCredentialReport",
@@ -28,21 +29,39 @@
         "ec2:DescribeVolumes",
         "ec2:DescribeInstances",
         "ec2:DescribeVpcs",
+        "ec2:DescribeFlowLogs",
+        "ec2:DescribeRegions",
+        "ec2:GetSnapshotBlockPublicAccessState",
         
         "rds:DescribeDBInstances",
         
         "cloudtrail:DescribeTrails",
         "cloudtrail:GetTrailStatus",
+        "cloudtrail:GetTrail",
         
         "guardduty:ListDetectors",
+        "guardduty:GetDetector",
         
         "configservice:DescribeConfigurationRecorders",
+        "configservice:DescribeDeliveryChannels",
         
         "securityhub:DescribeHub",
+        "securityhub:GetFindings",
         
         "kms:ListKeys",
         "kms:DescribeKey",
-        "kms:GetKeyRotationStatus"
+        "kms:GetKeyRotationStatus",
+        "kms:ListAliases",
+        
+        "secretsmanager:ListSecrets",
+        
+        "ecr:DescribeRepositories",
+        
+        "lambda:ListFunctions",
+        
+        "access-analyzer:ListAnalyzers",
+        
+        "sts:GetCallerIdentity"
       ],
       "Resource": "*"
     }
