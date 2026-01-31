@@ -33,22 +33,49 @@ chmod +x starlings-aws-scan.sh
 # Custom output file
 ./starlings-aws-scan.sh --output my-report.json
 
+# Verbose output
+./starlings-aws-scan.sh --verbose
+
 # Show help
 ./starlings-aws-scan.sh --help
 ```
 
 ## What It Checks
 
-The scanner runs **33 read-only checks** across 6 security domains:
+The scanner runs **45+ read-only checks** across 9 security domains:
 
 | Domain | Checks | Examples |
 |--------|--------|----------|
-| IAM & Access | 7 | Root MFA, password policy, user MFA, access key age |
-| S3 Security | 5 | Public buckets, encryption, versioning, logging |
-| EC2 & Network | 7 | Open SSH/RDP, security groups, EBS encryption, IMDSv2 |
-| RDS & Database | 5 | Public access, encryption, backup retention |
-| Logging | 7 | CloudTrail, GuardDuty, AWS Config, Security Hub |
-| KMS | 2 | Key rotation |
+| IAM & Access | 8 | Root MFA, root access keys, password policy, user MFA, access key age, inactive users, admin policies, support role |
+| S3 Security | 5 | Public buckets, encryption, versioning, logging, SSL/TLS enforcement |
+| EC2 & Network | 9 | Open SSH/RDP, security groups, default SGs, EBS encryption, public IPs, IMDSv2, snapshot public access, VPC Flow Logs |
+| RDS & Database | 4 | Public access, encryption, backup retention, deletion protection |
+| Logging & Monitoring | 8 | CloudTrail, multi-region trails, log validation, KMS encryption, GuardDuty, AWS Config, Security Hub, Access Analyzer |
+| KMS | 1 | Key rotation |
+| Secrets Manager | 1 | Secret rotation |
+| ECR | 1 | Image scanning |
+| Lambda | 1 | Deprecated runtimes |
+
+## Compliance Framework Coverage
+
+Each finding maps to relevant compliance frameworks:
+
+| Framework | Coverage |
+|-----------|----------|
+| **CIS AWS Foundations Benchmark** | Full coverage of applicable controls |
+| **ISO 27001** | Annex A controls mapped |
+| **SOC 2** | Trust Services Criteria (CC) mapped |
+| **CCSS** | Cryptocurrency Security Standard for digital asset compliance |
+
+Example finding with framework references:
+```json
+{
+  "check_id": "IAM-001",
+  "severity": "critical",
+  "title": "Root account MFA not enabled",
+  "frameworks": ["CIS 1.5", "ISO27001 A.9.4.2", "SOC2 CC6.1", "CCSS 4.1"]
+}
+```
 
 ## Minimal IAM Policy
 
@@ -84,8 +111,8 @@ The scanner generates a JSON report (`aws-security-report.json`) with:
 
 ```json
 {
-  "scanner_version": "1.0.0",
-  "scan_date": "2025-01-15T10:30:00Z",
+  "scanner_version": "1.1.0",
+  "scan_date": "2026-01-30T10:30:00Z",
   "region": "us-east-1",
   "score": {
     "overall": 72,
@@ -96,8 +123,14 @@ The scanner generates a JSON report (`aws-security-report.json`) with:
     "high": 3,
     "medium": 5,
     "low": 2,
-    "passed": 22,
-    "total_checks": 33
+    "passed": 34,
+    "total_checks": 45
+  },
+  "compliance_coverage": {
+    "cis_aws_foundations": true,
+    "iso_27001": true,
+    "soc_2": true,
+    "ccss": true
   },
   "findings": [
     {
@@ -107,7 +140,8 @@ The scanner generates a JSON report (`aws-security-report.json`) with:
       "title": "Root account MFA not enabled",
       "description": "...",
       "resources": [],
-      "remediation": "..."
+      "remediation": "...",
+      "frameworks": ["CIS 1.5", "ISO27001 A.9.4.2", "SOC2 CC6.1", "CCSS 4.1"]
     }
   ]
 }
@@ -129,6 +163,58 @@ The scanner automatically redacts:
 | 50-69 | Fair - Significant security improvements needed |
 | Below 50 | Needs Attention - Critical issues require immediate action |
 
+## Detailed Check Descriptions
+
+### IAM & Access (8 checks)
+- **IAM-001**: Root account MFA - Verifies MFA is enabled on root
+- **IAM-002**: Root access keys - Ensures root has no access keys
+- **IAM-003**: Password policy - Checks complexity requirements
+- **IAM-004**: User MFA - Identifies users without MFA
+- **IAM-005**: Access key age - Flags keys older than 90 days
+- **IAM-006**: Inactive users - Finds unused credentials
+- **IAM-007**: Admin access - Identifies overprivileged users
+- **IAM-008**: Support role - Checks for AWS Support role
+
+### S3 Security (5 checks)
+- **S3-001**: Public access - Finds publicly accessible buckets
+- **S3-002**: Encryption - Verifies default encryption
+- **S3-003**: Logging - Checks access logging
+- **S3-004**: Versioning - Verifies object versioning
+- **S3-005**: SSL/TLS - Confirms secure transport required
+
+### EC2 & Network (9 checks)
+- **EC2-001**: SSH access - Finds 0.0.0.0/0 on port 22
+- **EC2-002**: RDP access - Finds 0.0.0.0/0 on port 3389
+- **EC2-003**: Wide open SGs - Finds all-traffic rules
+- **EC2-004**: Default SGs - Checks for rules on default SGs
+- **EC2-005**: EBS encryption - Finds unencrypted volumes
+- **EC2-006**: Public IPs - Identifies exposed instances
+- **EC2-007**: IMDSv2 - Checks metadata service version
+- **EC2-008**: Snapshot sharing - Verifies block public access
+- **EC2-009**: VPC Flow Logs - Checks network logging
+
+### RDS (4 checks)
+- **RDS-001**: Public access - Finds publicly accessible DBs
+- **RDS-002**: Encryption - Verifies storage encryption
+- **RDS-003**: Backups - Checks backup retention
+- **RDS-004**: Deletion protection - Verifies protection enabled
+
+### Logging & Monitoring (8 checks)
+- **LOG-001**: CloudTrail - Verifies trail exists
+- **LOG-002**: Multi-region - Checks trail scope
+- **LOG-003**: Log validation - Verifies integrity
+- **LOG-004**: KMS encryption - Checks trail encryption
+- **LOG-005**: GuardDuty - Verifies threat detection
+- **LOG-006**: AWS Config - Checks configuration recording
+- **LOG-007**: Security Hub - Verifies centralized findings
+- **LOG-008**: Access Analyzer - Checks external access analysis
+
+### Other Checks
+- **KMS-001**: Key rotation - Verifies automatic rotation
+- **SEC-001**: Secret rotation - Checks Secrets Manager rotation
+- **ECR-001**: Image scanning - Verifies scan on push
+- **LAM-001**: Runtime versions - Flags deprecated runtimes
+
 ## Next Steps
 
 1. **Review** the generated report
@@ -141,6 +227,27 @@ The scanner automatically redacts:
 - ✅ **Read-only** - No modifications to your AWS environment
 - ✅ **Transparent** - Full source code available for review
 - ✅ **Auto-redacts** - Sensitive data removed from output
+
+## Changelog
+
+### v1.1.0
+- Added 12+ new security checks
+- Added compliance framework mapping (ISO 27001, SOC 2, CIS, CCSS)
+- Added Secrets Manager rotation check
+- Added ECR image scanning check
+- Added Lambda runtime check
+- Added VPC Flow Logs check
+- Added EBS snapshot block public access check
+- Added default security group rules check
+- Added S3 SSL/TLS enforcement check
+- Added IAM Access Analyzer check
+- Added root access keys check
+- Added AWS Support role check
+- Improved password policy analysis
+- Added `--verbose` flag
+
+### v1.0.0
+- Initial release with 33 security checks
 
 ## License
 

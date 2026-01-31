@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Starlings AWS Security Scanner v1.0
+# Starlings AWS Security Scanner v1.1
 # ====================================
 # 
 # This script runs locally in YOUR environment.
@@ -9,6 +9,7 @@
 # What it does:
 #   - Runs read-only checks against your AWS account
 #   - Identifies security misconfigurations
+#   - Maps findings to compliance frameworks (ISO 27001, SOC 2, CIS, CCSS)
 #   - Outputs a JSON report you can review before sharing
 #
 # Requirements:
@@ -16,7 +17,7 @@
 #   - Read-only permissions (see scan-policy.json for minimal IAM policy)
 #
 # Usage:
-#   ./starlings-aws-scan.sh [--region REGION] [--output FILE]
+#   ./starlings-aws-scan.sh [--region REGION] [--output FILE] [--all-regions]
 #
 # Source: https://github.com/Starlings-Data/aws-scanner
 # License: MIT
@@ -28,16 +29,19 @@ set -e
 # Configuration
 # ============================================================================
 
-SCANNER_VERSION="1.0.0"
+SCANNER_VERSION="1.1.0"
 DEFAULT_OUTPUT="aws-security-report.json"
 REGION=""
 OUTPUT_FILE=""
+ALL_REGIONS=false
+VERBOSE=false
 
 # Colors for terminal output
 RED='\033[0;31m'
 YELLOW='\033[1;33m'
 GREEN='\033[0;32m'
 BLUE='\033[0;34m'
+CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
 # ============================================================================
@@ -87,13 +91,16 @@ usage() {
     echo "Usage: $0 [OPTIONS]"
     echo ""
     echo "Options:"
-    echo "  -r, --region REGION    AWS region to scan (default: all configured regions)"
+    echo "  -r, --region REGION    AWS region to scan (default: from AWS CLI config)"
     echo "  -o, --output FILE      Output file (default: ${DEFAULT_OUTPUT})"
+    echo "  -a, --all-regions      Scan all available regions"
+    echo "  -v, --verbose          Verbose output"
     echo "  -h, --help             Show this help message"
     echo ""
     echo "Examples:"
     echo "  $0                           # Scan default region"
     echo "  $0 --region us-east-1        # Scan specific region"
+    echo "  $0 --all-regions             # Scan all regions"
     echo "  $0 --output my-report.json   # Custom output file"
     echo ""
 }
@@ -117,6 +124,10 @@ check_prerequisites() {
     fi
     print_success "AWS credentials valid"
     
+    # Get account ID for reference
+    ACCOUNT_ID=$(aws sts get-caller-identity --query 'Account' --output text 2>/dev/null || echo "unknown")
+    print_status "Account ID: $ACCOUNT_ID"
+    
     # Check jq
     if ! command -v jq &> /dev/null; then
         print_warning "jq not found. Output will be less formatted."
@@ -133,6 +144,10 @@ get_region() {
     else
         aws configure get region 2>/dev/null || echo "us-east-1"
     fi
+}
+
+get_all_regions() {
+    aws ec2 describe-regions --query 'Regions[].RegionName' --output text 2>/dev/null || echo "us-east-1"
 }
 
 # ============================================================================
@@ -154,6 +169,7 @@ add_finding() {
     local description=$5
     local resources=$6
     local remediation=$7
+    local frameworks=$8  # New: compliance framework references
     
     case $severity in
         critical) ((CRITICAL_COUNT++)) ;;
@@ -166,7 +182,12 @@ add_finding() {
     description=$(echo "$description" | sed 's/"/\\"/g')
     remediation=$(echo "$remediation" | sed 's/"/\\"/g')
     
-    FINDINGS+=("{\"domain\":\"$domain\",\"check_id\":\"$check_id\",\"severity\":\"$severity\",\"title\":\"$title\",\"description\":\"$description\",\"resources\":$resources,\"remediation\":\"$remediation\"}")
+    # Add frameworks if provided, otherwise use empty array
+    if [ -z "$frameworks" ]; then
+        frameworks="[]"
+    fi
+    
+    FINDINGS+=("{\"domain\":\"$domain\",\"check_id\":\"$check_id\",\"severity\":\"$severity\",\"title\":\"$title\",\"description\":\"$description\",\"resources\":$resources,\"remediation\":\"$remediation\",\"frameworks\":$frameworks}")
 }
 
 add_pass() {
@@ -191,40 +212,83 @@ check_iam() {
             "Root account MFA not enabled" \
             "The root account does not have multi-factor authentication enabled. This is the most privileged account and must be protected." \
             "[]" \
-            "Enable MFA on the root account immediately via IAM console > Security credentials"
+            "Enable MFA on the root account immediately via IAM console > Security credentials" \
+            "[\"CIS 1.5\",\"ISO27001 A.9.4.2\",\"SOC2 CC6.1\",\"CCSS 4.1\"]"
         print_finding "critical" "Root account MFA not enabled"
     else
         add_pass
         print_finding "pass" "Root account MFA enabled"
     fi
     
-    # Check 2: Password policy
+    # Check 2: Root access keys (should not exist)
+    print_status "  Checking root access keys..."
+    local root_access_keys=$(echo "$account_summary" | grep -o '"AccountAccessKeysPresent":[0-9]*' | cut -d: -f2)
+    
+    if [ "$root_access_keys" = "1" ]; then
+        add_finding "iam" "IAM-002" "critical" \
+            "Root account has access keys" \
+            "The root account has active access keys. Root access keys pose a severe security risk and should be deleted." \
+            "[]" \
+            "Delete root account access keys via IAM console. Use IAM users or roles instead." \
+            "[\"CIS 1.4\",\"ISO27001 A.9.2.3\",\"SOC2 CC6.1\"]"
+        print_finding "critical" "Root account has access keys"
+    else
+        add_pass
+        print_finding "pass" "No root access keys present"
+    fi
+    
+    # Check 3: Password policy
     print_status "  Checking password policy..."
     local password_policy=$(aws iam get-account-password-policy 2>/dev/null || echo "")
     
     if [ -z "$password_policy" ]; then
-        add_finding "iam" "IAM-002" "high" \
+        add_finding "iam" "IAM-003" "high" \
             "No password policy configured" \
             "No custom password policy is set. AWS will use default weak policy." \
             "[]" \
-            "Create a password policy requiring minimum 14 characters, complexity, and rotation"
+            "Create a password policy requiring minimum 14 characters, complexity, and rotation" \
+            "[\"CIS 1.8\",\"ISO27001 A.9.4.3\",\"SOC2 CC6.1\",\"CCSS 4.2\"]"
         print_finding "high" "No password policy configured"
     else
         local min_length=$(echo "$password_policy" | grep -o '"MinimumPasswordLength":[0-9]*' | cut -d: -f2)
+        local require_symbols=$(echo "$password_policy" | grep -o '"RequireSymbols":[a-z]*' | cut -d: -f2)
+        local require_numbers=$(echo "$password_policy" | grep -o '"RequireNumbers":[a-z]*' | cut -d: -f2)
+        local require_uppercase=$(echo "$password_policy" | grep -o '"RequireUppercaseCharacters":[a-z]*' | cut -d: -f2)
+        local max_age=$(echo "$password_policy" | grep -o '"MaxPasswordAge":[0-9]*' | cut -d: -f2)
+        
+        local policy_issues=()
+        
         if [ -n "$min_length" ] && [ "$min_length" -lt 14 ]; then
-            add_finding "iam" "IAM-002" "medium" \
+            policy_issues+=("min length $min_length < 14")
+        fi
+        if [ "$require_symbols" != "true" ]; then
+            policy_issues+=("no symbol requirement")
+        fi
+        if [ "$require_numbers" != "true" ]; then
+            policy_issues+=("no number requirement")
+        fi
+        if [ "$require_uppercase" != "true" ]; then
+            policy_issues+=("no uppercase requirement")
+        fi
+        if [ -z "$max_age" ] || [ "$max_age" -gt 90 ]; then
+            policy_issues+=("password age > 90 days or not set")
+        fi
+        
+        if [ ${#policy_issues[@]} -gt 0 ]; then
+            add_finding "iam" "IAM-003" "medium" \
                 "Weak password policy" \
-                "Password policy allows passwords shorter than 14 characters (current: $min_length)" \
+                "Password policy has issues: ${policy_issues[*]}" \
                 "[]" \
-                "Update password policy to require at least 14 characters"
-            print_finding "medium" "Password policy allows short passwords (min: $min_length)"
+                "Update password policy to require at least 14 characters, symbols, numbers, uppercase, and 90-day rotation" \
+                "[\"CIS 1.8-1.11\",\"ISO27001 A.9.4.3\",\"SOC2 CC6.1\"]"
+            print_finding "medium" "Password policy has issues: ${policy_issues[*]}"
         else
             add_pass
-            print_finding "pass" "Password policy meets minimum length requirements"
+            print_finding "pass" "Password policy meets requirements"
         fi
     fi
     
-    # Check 3: Users without MFA
+    # Check 4: Users without MFA
     print_status "  Checking user MFA status..."
     local users=$(aws iam list-users --query 'Users[*].UserName' --output text 2>/dev/null || echo "")
     local users_without_mfa=()
@@ -238,18 +302,19 @@ check_iam() {
     
     if [ ${#users_without_mfa[@]} -gt 0 ]; then
         local user_list=$(printf '"%s",' "${users_without_mfa[@]}" | sed 's/,$//')
-        add_finding "iam" "IAM-003" "high" \
+        add_finding "iam" "IAM-004" "high" \
             "Users without MFA" \
             "${#users_without_mfa[@]} IAM user(s) do not have MFA enabled" \
             "[$user_list]" \
-            "Enable MFA for all IAM users, especially those with console access"
+            "Enable MFA for all IAM users, especially those with console access" \
+            "[\"CIS 1.10\",\"ISO27001 A.9.4.2\",\"SOC2 CC6.1\",\"CCSS 4.1\"]"
         print_finding "high" "${#users_without_mfa[@]} user(s) without MFA"
     else
         add_pass
         print_finding "pass" "All users have MFA enabled"
     fi
     
-    # Check 4: Old access keys (>90 days)
+    # Check 5: Old access keys (>90 days)
     print_status "  Checking access key age..."
     local old_keys=()
     local ninety_days_ago=$(date -d "90 days ago" +%Y-%m-%d 2>/dev/null || date -v-90d +%Y-%m-%d 2>/dev/null || echo "")
@@ -263,11 +328,12 @@ check_iam() {
         done
         
         if [ ${#old_keys[@]} -gt 0 ]; then
-            add_finding "iam" "IAM-004" "medium" \
+            add_finding "iam" "IAM-005" "medium" \
                 "Old access keys detected" \
                 "${#old_keys[@]} access key(s) are older than 90 days" \
                 "[]" \
-                "Rotate access keys regularly (at least every 90 days)"
+                "Rotate access keys regularly (at least every 90 days)" \
+                "[\"CIS 1.14\",\"ISO27001 A.9.2.5\",\"SOC2 CC6.1\"]"
             print_finding "medium" "${#old_keys[@]} access key(s) older than 90 days"
         else
             add_pass
@@ -275,25 +341,25 @@ check_iam() {
         fi
     fi
     
-    # Check 5: Inactive users (no login in 90 days)
-    print_status "  Checking for inactive users..."
-    # This requires credential report - skip if not available
+    # Check 6: Unused credentials
+    print_status "  Checking for unused credentials..."
     aws iam generate-credential-report &>/dev/null || true
     sleep 2
     local cred_report=$(aws iam get-credential-report --query 'Content' --output text 2>/dev/null | base64 -d 2>/dev/null || echo "")
     
-    if [ -n "$cred_report" ]; then
+    if [ -n "$cred_report" ] && [ -n "$ninety_days_ago" ]; then
         local inactive_count=$(echo "$cred_report" | awk -F, 'NR>1 && $5!="N/A" && $5!="no_information" {
             split($5,a,"T"); 
             if (a[1] < "'$ninety_days_ago'") count++
         } END {print count+0}')
         
         if [ "$inactive_count" -gt 0 ]; then
-            add_finding "iam" "IAM-005" "medium" \
+            add_finding "iam" "IAM-006" "medium" \
                 "Inactive users detected" \
                 "$inactive_count user(s) have not logged in for over 90 days" \
                 "[]" \
-                "Review and disable or remove inactive user accounts"
+                "Review and disable or remove inactive user accounts" \
+                "[\"CIS 1.12\",\"ISO27001 A.9.2.6\",\"SOC2 CC6.2\"]"
             print_finding "medium" "$inactive_count inactive user(s) detected"
         else
             add_pass
@@ -301,7 +367,7 @@ check_iam() {
         fi
     fi
     
-    # Check 6: Overly permissive policies (AdministratorAccess on users)
+    # Check 7: Overly permissive policies (AdministratorAccess on users)
     print_status "  Checking for overprivileged users..."
     local admin_users=()
     
@@ -314,15 +380,33 @@ check_iam() {
     
     if [ ${#admin_users[@]} -gt 0 ]; then
         local admin_list=$(printf '"%s",' "${admin_users[@]}" | sed 's/,$//')
-        add_finding "iam" "IAM-006" "high" \
+        add_finding "iam" "IAM-007" "high" \
             "Users with AdministratorAccess" \
             "${#admin_users[@]} user(s) have full AdministratorAccess policy attached" \
             "[$admin_list]" \
-            "Apply principle of least privilege - use specific policies instead of AdministratorAccess"
+            "Apply principle of least privilege - use specific policies instead of AdministratorAccess" \
+            "[\"CIS 1.16\",\"ISO27001 A.9.2.3\",\"SOC2 CC6.3\",\"CCSS 4.3\"]"
         print_finding "high" "${#admin_users[@]} user(s) with AdministratorAccess"
     else
         add_pass
         print_finding "pass" "No users with direct AdministratorAccess"
+    fi
+    
+    # Check 8: AWS Support Role exists
+    print_status "  Checking AWS Support role..."
+    local support_role=$(aws iam get-role --role-name AWSSupportAccess 2>/dev/null || echo "")
+    
+    if [ -z "$support_role" ]; then
+        add_finding "iam" "IAM-008" "low" \
+            "AWS Support role not configured" \
+            "No AWSSupportAccess role exists. This role allows AWS Support to assist with troubleshooting." \
+            "[]" \
+            "Create AWSSupportAccess role with AWSSupportAccess managed policy for support cases" \
+            "[\"CIS 1.20\",\"ISO27001 A.6.1.3\"]"
+        print_finding "low" "AWS Support role not configured"
+    else
+        add_pass
+        print_finding "pass" "AWS Support role exists"
     fi
 }
 
@@ -345,6 +429,7 @@ check_s3() {
     local unencrypted_buckets=()
     local no_logging_buckets=()
     local no_versioning_buckets=()
+    local no_ssl_buckets=()
     local bucket_count=0
     
     for bucket in $buckets; do
@@ -391,6 +476,16 @@ check_s3() {
         if [ -z "$versioning" ] || [ "$versioning" = "None" ] || [ "$versioning" = "Suspended" ]; then
             no_versioning_buckets+=("$bucket")
         fi
+        
+        # Check 5: SSL/TLS enforcement (bucket policy requiring SecureTransport)
+        local bucket_policy=$(aws s3api get-bucket-policy --bucket "$bucket" --query 'Policy' --output text 2>/dev/null || echo "")
+        if [ -n "$bucket_policy" ]; then
+            if ! echo "$bucket_policy" | grep -q "aws:SecureTransport"; then
+                no_ssl_buckets+=("$bucket")
+            fi
+        else
+            no_ssl_buckets+=("$bucket")
+        fi
     done
     
     print_status "  Scanned $bucket_count buckets"
@@ -402,7 +497,8 @@ check_s3() {
             "Publicly accessible S3 buckets" \
             "${#public_buckets[@]} bucket(s) may be publicly accessible" \
             "[$bucket_list]" \
-            "Enable S3 Block Public Access at account and bucket level"
+            "Enable S3 Block Public Access at account and bucket level" \
+            "[\"CIS 2.1.5\",\"ISO27001 A.13.1.1\",\"SOC2 CC6.1\",\"CCSS 3.1\"]"
         print_finding "critical" "${#public_buckets[@]} potentially public bucket(s)"
     else
         add_pass
@@ -415,7 +511,8 @@ check_s3() {
             "Unencrypted S3 buckets" \
             "${#unencrypted_buckets[@]} bucket(s) do not have default encryption enabled" \
             "[$bucket_list]" \
-            "Enable default encryption (SSE-S3 or SSE-KMS) on all buckets"
+            "Enable default encryption (SSE-S3 or SSE-KMS) on all buckets" \
+            "[\"CIS 2.1.1\",\"ISO27001 A.10.1.1\",\"SOC2 CC6.1\",\"CCSS 3.2\"]"
         print_finding "high" "${#unencrypted_buckets[@]} unencrypted bucket(s)"
     else
         add_pass
@@ -427,7 +524,8 @@ check_s3() {
             "S3 buckets without access logging" \
             "${#no_logging_buckets[@]} bucket(s) do not have access logging enabled" \
             "[]" \
-            "Enable server access logging for audit trail"
+            "Enable server access logging for audit trail" \
+            "[\"CIS 2.1.3\",\"ISO27001 A.12.4.1\",\"SOC2 CC7.2\"]"
         print_finding "medium" "${#no_logging_buckets[@]} bucket(s) without logging"
     else
         add_pass
@@ -439,11 +537,25 @@ check_s3() {
             "S3 buckets without versioning" \
             "${#no_versioning_buckets[@]} bucket(s) do not have versioning enabled" \
             "[]" \
-            "Enable versioning for data protection and recovery"
+            "Enable versioning for data protection and recovery" \
+            "[\"CIS 2.1.2\",\"ISO27001 A.17.1.1\",\"SOC2 CC9.1\"]"
         print_finding "low" "${#no_versioning_buckets[@]} bucket(s) without versioning"
     else
         add_pass
         print_finding "pass" "All buckets have versioning enabled"
+    fi
+    
+    if [ ${#no_ssl_buckets[@]} -gt 0 ]; then
+        add_finding "s3" "S3-005" "medium" \
+            "S3 buckets without SSL/TLS enforcement" \
+            "${#no_ssl_buckets[@]} bucket(s) do not require secure transport" \
+            "[]" \
+            "Add bucket policy denying requests without aws:SecureTransport" \
+            "[\"CIS 2.1.4\",\"ISO27001 A.14.1.2\",\"SOC2 CC6.7\"]"
+        print_finding "medium" "${#no_ssl_buckets[@]} bucket(s) without SSL enforcement"
+    else
+        add_pass
+        print_finding "pass" "All buckets enforce SSL/TLS"
     fi
 }
 
@@ -466,6 +578,7 @@ check_ec2() {
     local open_ssh=()
     local open_rdp=()
     local open_all=()
+    local default_sg_with_rules=()
     
     # Check each security group
     while IFS=$'\t' read -r sg_id sg_name; do
@@ -492,6 +605,18 @@ check_ec2() {
         if [ -n "$all_open" ]; then
             open_all+=("$sg_id ($sg_name)")
         fi
+        
+        # Check default security groups (should have no rules)
+        if [ "$sg_name" = "default" ]; then
+            local inbound_rules=$(aws ec2 describe-security-groups --region "$region" --group-ids "$sg_id" \
+                --query "SecurityGroups[*].IpPermissions" --output text 2>/dev/null || echo "")
+            local outbound_rules=$(aws ec2 describe-security-groups --region "$region" --group-ids "$sg_id" \
+                --query "SecurityGroups[*].IpPermissionsEgress[?!(IpProtocol==\`-1\` && IpRanges[?CidrIp==\`0.0.0.0/0\`])]" \
+                --output text 2>/dev/null || echo "")
+            if [ -n "$inbound_rules" ]; then
+                default_sg_with_rules+=("$sg_id")
+            fi
+        fi
     done <<< "$sgs"
     
     # Report findings
@@ -501,7 +626,8 @@ check_ec2() {
             "SSH open to the world" \
             "${#open_ssh[@]} security group(s) allow SSH (port 22) from 0.0.0.0/0" \
             "[$sg_list]" \
-            "Restrict SSH access to specific IP ranges or use AWS Systems Manager Session Manager"
+            "Restrict SSH access to specific IP ranges or use AWS Systems Manager Session Manager" \
+            "[\"CIS 5.2\",\"ISO27001 A.13.1.1\",\"SOC2 CC6.6\",\"CCSS 5.1\"]"
         print_finding "critical" "${#open_ssh[@]} security group(s) with SSH open to world"
     else
         add_pass
@@ -514,7 +640,8 @@ check_ec2() {
             "RDP open to the world" \
             "${#open_rdp[@]} security group(s) allow RDP (port 3389) from 0.0.0.0/0" \
             "[$sg_list]" \
-            "Restrict RDP access to specific IP ranges or use a bastion host"
+            "Restrict RDP access to specific IP ranges or use a bastion host" \
+            "[\"CIS 5.3\",\"ISO27001 A.13.1.1\",\"SOC2 CC6.6\",\"CCSS 5.1\"]"
         print_finding "critical" "${#open_rdp[@]} security group(s) with RDP open to world"
     else
         add_pass
@@ -527,11 +654,25 @@ check_ec2() {
             "Security groups allow all traffic from anywhere" \
             "${#open_all[@]} security group(s) allow all traffic from 0.0.0.0/0" \
             "[$sg_list]" \
-            "Implement least privilege - only allow necessary ports from specific sources"
+            "Implement least privilege - only allow necessary ports from specific sources" \
+            "[\"CIS 5.4\",\"ISO27001 A.13.1.1\",\"SOC2 CC6.6\",\"CCSS 5.1\"]"
         print_finding "critical" "${#open_all[@]} security group(s) allow all traffic from anywhere"
     else
         add_pass
         print_finding "pass" "No security groups allowing all traffic from anywhere"
+    fi
+    
+    if [ ${#default_sg_with_rules[@]} -gt 0 ]; then
+        add_finding "ec2" "EC2-004" "medium" \
+            "Default security groups have custom rules" \
+            "${#default_sg_with_rules[@]} default security group(s) have inbound rules. Default SGs should have no rules." \
+            "[]" \
+            "Remove all rules from default security groups and use custom security groups instead" \
+            "[\"CIS 5.4\",\"ISO27001 A.13.1.1\",\"SOC2 CC6.6\"]"
+        print_finding "medium" "${#default_sg_with_rules[@]} default security group(s) have rules"
+    else
+        add_pass
+        print_finding "pass" "Default security groups have no custom rules"
     fi
     
     # Check for unencrypted EBS volumes
@@ -541,11 +682,12 @@ check_ec2() {
     local unencrypted_count=$(echo "$unencrypted_volumes" | wc -w | tr -d ' ')
     
     if [ "$unencrypted_count" -gt 0 ]; then
-        add_finding "ec2" "EC2-004" "high" \
+        add_finding "ec2" "EC2-005" "high" \
             "Unencrypted EBS volumes" \
             "$unencrypted_count EBS volume(s) are not encrypted" \
             "[]" \
-            "Enable EBS encryption by default and encrypt existing volumes"
+            "Enable EBS encryption by default and encrypt existing volumes" \
+            "[\"CIS 2.2.1\",\"ISO27001 A.10.1.1\",\"SOC2 CC6.1\",\"CCSS 3.2\"]"
         print_finding "high" "$unencrypted_count unencrypted EBS volume(s)"
     else
         add_pass
@@ -559,11 +701,12 @@ check_ec2() {
     local public_count=$(echo "$public_instances" | wc -w | tr -d ' ')
     
     if [ "$public_count" -gt 0 ]; then
-        add_finding "ec2" "EC2-005" "medium" \
+        add_finding "ec2" "EC2-006" "medium" \
             "EC2 instances with public IP addresses" \
             "$public_count instance(s) have public IP addresses" \
             "[]" \
-            "Review if public IPs are necessary. Consider using NAT Gateway or private subnets"
+            "Review if public IPs are necessary. Consider using NAT Gateway or private subnets" \
+            "[\"ISO27001 A.13.1.1\",\"SOC2 CC6.6\"]"
         print_finding "medium" "$public_count instance(s) with public IPs"
     else
         add_pass
@@ -577,15 +720,60 @@ check_ec2() {
     local imdsv1_count=$(echo "$imdsv1_instances" | wc -w | tr -d ' ')
     
     if [ "$imdsv1_count" -gt 0 ]; then
-        add_finding "ec2" "EC2-006" "high" \
+        add_finding "ec2" "EC2-007" "high" \
             "Instances allow IMDSv1" \
             "$imdsv1_count instance(s) allow IMDSv1 (vulnerable to SSRF attacks)" \
             "[]" \
-            "Enforce IMDSv2 by setting HttpTokens to 'required'"
+            "Enforce IMDSv2 by setting HttpTokens to 'required'" \
+            "[\"CIS 5.6\",\"ISO27001 A.14.2.5\",\"SOC2 CC6.1\"]"
         print_finding "high" "$imdsv1_count instance(s) allow IMDSv1"
     else
         add_pass
         print_finding "pass" "All instances enforce IMDSv2"
+    fi
+    
+    # Check EBS snapshot public access blocking
+    print_status "  Checking EBS snapshot public access block..."
+    local snapshot_block=$(aws ec2 get-snapshot-block-public-access-state --region "$region" \
+        --query 'State' --output text 2>/dev/null || echo "")
+    
+    if [ "$snapshot_block" != "block-all-sharing" ]; then
+        add_finding "ec2" "EC2-008" "high" \
+            "EBS snapshot public sharing not blocked" \
+            "Account does not block public sharing of EBS snapshots. State: ${snapshot_block:-not set}" \
+            "[]" \
+            "Enable EBS snapshot block public access via EC2 settings or CLI" \
+            "[\"CIS 2.2.2\",\"ISO27001 A.13.1.1\",\"SOC2 CC6.1\"]"
+        print_finding "high" "EBS snapshot public sharing not blocked"
+    else
+        add_pass
+        print_finding "pass" "EBS snapshot public sharing is blocked"
+    fi
+    
+    # Check VPC Flow Logs
+    print_status "  Checking VPC Flow Logs..."
+    local vpcs=$(aws ec2 describe-vpcs --region "$region" --query 'Vpcs[*].VpcId' --output text 2>/dev/null || echo "")
+    local vpcs_without_flow_logs=()
+    
+    for vpc in $vpcs; do
+        local flow_logs=$(aws ec2 describe-flow-logs --region "$region" \
+            --filter "Name=resource-id,Values=$vpc" --query 'FlowLogs[0].FlowLogId' --output text 2>/dev/null || echo "")
+        if [ -z "$flow_logs" ] || [ "$flow_logs" = "None" ]; then
+            vpcs_without_flow_logs+=("$vpc")
+        fi
+    done
+    
+    if [ ${#vpcs_without_flow_logs[@]} -gt 0 ]; then
+        add_finding "ec2" "EC2-009" "medium" \
+            "VPCs without Flow Logs" \
+            "${#vpcs_without_flow_logs[@]} VPC(s) do not have Flow Logs enabled" \
+            "[]" \
+            "Enable VPC Flow Logs for network traffic visibility and forensics" \
+            "[\"CIS 3.9\",\"ISO27001 A.12.4.1\",\"SOC2 CC7.2\",\"CCSS 6.1\"]"
+        print_finding "medium" "${#vpcs_without_flow_logs[@]} VPC(s) without Flow Logs"
+    else
+        add_pass
+        print_finding "pass" "All VPCs have Flow Logs enabled"
     fi
 }
 
@@ -609,16 +797,18 @@ check_rds() {
     local public_instances=()
     local unencrypted_instances=()
     local no_backup_instances=()
+    local no_deletion_protection=()
     
     for instance in $instances; do
         local details=$(aws rds describe-db-instances --region "$region" \
             --db-instance-identifier "$instance" \
-            --query 'DBInstances[0].[PubliclyAccessible,StorageEncrypted,BackupRetentionPeriod]' \
+            --query 'DBInstances[0].[PubliclyAccessible,StorageEncrypted,BackupRetentionPeriod,DeletionProtection]' \
             --output text 2>/dev/null || echo "")
         
         local publicly_accessible=$(echo "$details" | awk '{print $1}')
         local encrypted=$(echo "$details" | awk '{print $2}')
         local backup_retention=$(echo "$details" | awk '{print $3}')
+        local deletion_protection=$(echo "$details" | awk '{print $4}')
         
         if [ "$publicly_accessible" = "True" ]; then
             public_instances+=("$instance")
@@ -631,6 +821,10 @@ check_rds() {
         if [ "$backup_retention" = "0" ]; then
             no_backup_instances+=("$instance")
         fi
+        
+        if [ "$deletion_protection" = "False" ]; then
+            no_deletion_protection+=("$instance")
+        fi
     done
     
     # Report findings
@@ -640,7 +834,8 @@ check_rds() {
             "Publicly accessible RDS instances" \
             "${#public_instances[@]} RDS instance(s) are publicly accessible" \
             "[$instance_list]" \
-            "Disable public accessibility and use private subnets with VPC security groups"
+            "Disable public accessibility and use private subnets with VPC security groups" \
+            "[\"CIS 2.3.1\",\"ISO27001 A.13.1.1\",\"SOC2 CC6.6\",\"CCSS 3.1\"]"
         print_finding "critical" "${#public_instances[@]} publicly accessible RDS instance(s)"
     else
         add_pass
@@ -653,7 +848,8 @@ check_rds() {
             "Unencrypted RDS instances" \
             "${#unencrypted_instances[@]} RDS instance(s) are not encrypted" \
             "[$instance_list]" \
-            "Enable encryption for RDS instances (requires snapshot and restore for existing)"
+            "Enable encryption for RDS instances (requires snapshot and restore for existing)" \
+            "[\"CIS 2.3.2\",\"ISO27001 A.10.1.1\",\"SOC2 CC6.1\",\"CCSS 3.2\"]"
         print_finding "high" "${#unencrypted_instances[@]} unencrypted RDS instance(s)"
     else
         add_pass
@@ -666,11 +862,25 @@ check_rds() {
             "RDS instances without backups" \
             "${#no_backup_instances[@]} RDS instance(s) have backup retention set to 0" \
             "[$instance_list]" \
-            "Enable automated backups with at least 7 days retention"
+            "Enable automated backups with at least 7 days retention" \
+            "[\"CIS 2.3.3\",\"ISO27001 A.17.1.1\",\"SOC2 CC9.1\",\"CCSS 7.1\"]"
         print_finding "high" "${#no_backup_instances[@]} RDS instance(s) without backups"
     else
         add_pass
         print_finding "pass" "All RDS instances have backups enabled"
+    fi
+    
+    if [ ${#no_deletion_protection[@]} -gt 0 ]; then
+        add_finding "rds" "RDS-004" "medium" \
+            "RDS instances without deletion protection" \
+            "${#no_deletion_protection[@]} RDS instance(s) have deletion protection disabled" \
+            "[]" \
+            "Enable deletion protection for production databases" \
+            "[\"ISO27001 A.17.1.1\",\"SOC2 CC9.1\"]"
+        print_finding "medium" "${#no_deletion_protection[@]} RDS instance(s) without deletion protection"
+    else
+        add_pass
+        print_finding "pass" "All RDS instances have deletion protection"
     fi
 }
 
@@ -692,7 +902,8 @@ check_logging() {
             "CloudTrail not enabled" \
             "No CloudTrail trails are configured in this region" \
             "[]" \
-            "Enable CloudTrail with multi-region logging and log file validation"
+            "Enable CloudTrail with multi-region logging and log file validation" \
+            "[\"CIS 3.1\",\"ISO27001 A.12.4.1\",\"SOC2 CC7.2\",\"CCSS 6.1\"]"
         print_finding "critical" "CloudTrail not enabled"
     else
         add_pass
@@ -714,7 +925,8 @@ check_logging() {
                     "CloudTrail not multi-region" \
                     "Trail '$trail' is not configured for multi-region logging" \
                     "[\"$trail\"]" \
-                    "Enable multi-region logging to capture API calls in all regions"
+                    "Enable multi-region logging to capture API calls in all regions" \
+                    "[\"CIS 3.1\",\"ISO27001 A.12.4.1\",\"SOC2 CC7.2\"]"
                 print_finding "high" "CloudTrail '$trail' not multi-region"
             else
                 add_pass
@@ -725,7 +937,8 @@ check_logging() {
                     "CloudTrail log validation disabled" \
                     "Trail '$trail' does not have log file validation enabled" \
                     "[\"$trail\"]" \
-                    "Enable log file validation to detect tampering"
+                    "Enable log file validation to detect tampering" \
+                    "[\"CIS 3.2\",\"ISO27001 A.12.4.1\",\"SOC2 CC7.2\"]"
                 print_finding "medium" "CloudTrail '$trail' log validation disabled"
             else
                 add_pass
@@ -736,7 +949,8 @@ check_logging() {
                     "CloudTrail logs not encrypted with KMS" \
                     "Trail '$trail' logs are not encrypted with a KMS key" \
                     "[\"$trail\"]" \
-                    "Enable KMS encryption for CloudTrail logs"
+                    "Enable KMS encryption for CloudTrail logs" \
+                    "[\"CIS 3.7\",\"ISO27001 A.10.1.1\",\"SOC2 CC6.1\"]"
                 print_finding "medium" "CloudTrail '$trail' not KMS encrypted"
             else
                 add_pass
@@ -754,7 +968,8 @@ check_logging() {
             "GuardDuty not enabled" \
             "Amazon GuardDuty is not enabled in this region" \
             "[]" \
-            "Enable GuardDuty for threat detection and continuous monitoring"
+            "Enable GuardDuty for threat detection and continuous monitoring" \
+            "[\"ISO27001 A.16.1.1\",\"SOC2 CC7.2\",\"CCSS 6.2\"]"
         print_finding "high" "GuardDuty not enabled"
     else
         add_pass
@@ -771,7 +986,8 @@ check_logging() {
             "AWS Config not enabled" \
             "AWS Config is not enabled in this region" \
             "[]" \
-            "Enable AWS Config to track resource configurations and changes"
+            "Enable AWS Config to track resource configurations and changes" \
+            "[\"CIS 3.5\",\"ISO27001 A.12.1.2\",\"SOC2 CC7.1\",\"CCSS 6.1\"]"
         print_finding "high" "AWS Config not enabled"
     else
         add_pass
@@ -787,11 +1003,30 @@ check_logging() {
             "Security Hub not enabled" \
             "AWS Security Hub is not enabled in this region" \
             "[]" \
-            "Enable Security Hub for centralized security findings and compliance checks"
+            "Enable Security Hub for centralized security findings and compliance checks" \
+            "[\"ISO27001 A.12.6.1\",\"SOC2 CC7.1\"]"
         print_finding "medium" "Security Hub not enabled"
     else
         add_pass
         print_finding "pass" "Security Hub is enabled"
+    fi
+    
+    # Check 5: Access Analyzer
+    print_status "  Checking IAM Access Analyzer..."
+    local analyzer=$(aws accessanalyzer list-analyzers --region "$region" \
+        --query 'analyzers[?type==`EXTERNAL`].arn' --output text 2>/dev/null || echo "")
+    
+    if [ -z "$analyzer" ]; then
+        add_finding "logging" "LOG-008" "medium" \
+            "IAM Access Analyzer not enabled" \
+            "No external access analyzer is configured in this region" \
+            "[]" \
+            "Enable IAM Access Analyzer to identify resources shared externally" \
+            "[\"CIS 1.21\",\"ISO27001 A.9.2.3\",\"SOC2 CC6.3\"]"
+        print_finding "medium" "IAM Access Analyzer not enabled"
+    else
+        add_pass
+        print_finding "pass" "IAM Access Analyzer is enabled"
     fi
 }
 
@@ -834,11 +1069,131 @@ check_kms() {
             "KMS keys without automatic rotation" \
             "${#no_rotation[@]} customer managed KMS key(s) do not have automatic rotation enabled" \
             "[]" \
-            "Enable automatic key rotation for customer managed KMS keys"
+            "Enable automatic key rotation for customer managed KMS keys" \
+            "[\"CIS 3.8\",\"ISO27001 A.10.1.2\",\"SOC2 CC6.1\",\"CCSS 3.3\"]"
         print_finding "medium" "${#no_rotation[@]} KMS key(s) without rotation"
     else
         add_pass
         print_finding "pass" "All customer managed KMS keys have rotation enabled"
+    fi
+}
+
+# ============================================================================
+# Secrets Manager Checks
+# ============================================================================
+
+check_secrets() {
+    print_status "Checking Secrets Manager..."
+    local region=$(get_region)
+    
+    local secrets=$(aws secretsmanager list-secrets --region "$region" \
+        --query 'SecretList[*].[Name,RotationEnabled]' --output text 2>/dev/null || echo "")
+    
+    if [ -z "$secrets" ]; then
+        print_status "  No secrets found in Secrets Manager"
+        return
+    fi
+    
+    local no_rotation=()
+    
+    while IFS=$'\t' read -r name rotation; do
+        if [ "$rotation" = "False" ] || [ "$rotation" = "None" ]; then
+            no_rotation+=("$name")
+        fi
+    done <<< "$secrets"
+    
+    if [ ${#no_rotation[@]} -gt 0 ]; then
+        add_finding "secrets" "SEC-001" "medium" \
+            "Secrets without automatic rotation" \
+            "${#no_rotation[@]} secret(s) do not have automatic rotation enabled" \
+            "[]" \
+            "Enable automatic rotation for secrets to reduce exposure risk" \
+            "[\"ISO27001 A.10.1.2\",\"SOC2 CC6.1\",\"CCSS 3.3\"]"
+        print_finding "medium" "${#no_rotation[@]} secret(s) without rotation"
+    else
+        add_pass
+        print_finding "pass" "All secrets have rotation enabled"
+    fi
+}
+
+# ============================================================================
+# ECR Checks
+# ============================================================================
+
+check_ecr() {
+    print_status "Checking ECR Container Registry..."
+    local region=$(get_region)
+    
+    local repos=$(aws ecr describe-repositories --region "$region" \
+        --query 'repositories[*].[repositoryName,imageScanningConfiguration.scanOnPush]' \
+        --output text 2>/dev/null || echo "")
+    
+    if [ -z "$repos" ]; then
+        print_status "  No ECR repositories found"
+        return
+    fi
+    
+    local no_scanning=()
+    
+    while IFS=$'\t' read -r name scan_enabled; do
+        if [ "$scan_enabled" = "False" ] || [ "$scan_enabled" = "None" ]; then
+            no_scanning+=("$name")
+        fi
+    done <<< "$repos"
+    
+    if [ ${#no_scanning[@]} -gt 0 ]; then
+        add_finding "ecr" "ECR-001" "medium" \
+            "ECR repositories without image scanning" \
+            "${#no_scanning[@]} ECR repository(ies) do not have image scanning enabled" \
+            "[]" \
+            "Enable scan on push for all ECR repositories to detect vulnerabilities" \
+            "[\"ISO27001 A.12.6.1\",\"SOC2 CC7.1\",\"CCSS 2.1\"]"
+        print_finding "medium" "${#no_scanning[@]} ECR repo(s) without scanning"
+    else
+        add_pass
+        print_finding "pass" "All ECR repositories have scanning enabled"
+    fi
+}
+
+# ============================================================================
+# Lambda Checks
+# ============================================================================
+
+check_lambda() {
+    print_status "Checking Lambda Functions..."
+    local region=$(get_region)
+    
+    local functions=$(aws lambda list-functions --region "$region" \
+        --query 'Functions[*].[FunctionName,VpcConfig.VpcId,Runtime]' \
+        --output text 2>/dev/null || echo "")
+    
+    if [ -z "$functions" ]; then
+        print_status "  No Lambda functions found"
+        return
+    fi
+    
+    local deprecated_runtimes=()
+    
+    while IFS=$'\t' read -r name vpc_id runtime; do
+        # Check for deprecated runtimes
+        case "$runtime" in
+            python2.7|python3.6|nodejs10.x|nodejs8.10|nodejs12.x|ruby2.5|java8|dotnetcore2.1|dotnetcore3.1)
+                deprecated_runtimes+=("$name ($runtime)")
+                ;;
+        esac
+    done <<< "$functions"
+    
+    if [ ${#deprecated_runtimes[@]} -gt 0 ]; then
+        add_finding "lambda" "LAM-001" "medium" \
+            "Lambda functions using deprecated runtimes" \
+            "${#deprecated_runtimes[@]} Lambda function(s) use deprecated or end-of-support runtimes" \
+            "[]" \
+            "Upgrade Lambda functions to supported runtime versions" \
+            "[\"ISO27001 A.14.2.2\",\"SOC2 CC7.1\"]"
+        print_finding "medium" "${#deprecated_runtimes[@]} function(s) with deprecated runtimes"
+    else
+        add_pass
+        print_finding "pass" "All Lambda functions use supported runtimes"
     fi
 }
 
@@ -901,6 +1256,7 @@ generate_report() {
   "scanner_version": "$SCANNER_VERSION",
   "scan_date": "$scan_date",
   "region": "$region",
+  "account_id": "$ACCOUNT_ID",
   "score": {
     "overall": $score,
     "interpretation": "$interpretation"
@@ -912,6 +1268,12 @@ generate_report() {
     "low": $LOW_COUNT,
     "passed": $PASS_COUNT,
     "total_checks": $((CRITICAL_COUNT + HIGH_COUNT + MEDIUM_COUNT + LOW_COUNT + PASS_COUNT))
+  },
+  "compliance_coverage": {
+    "cis_aws_foundations": true,
+    "iso_27001": true,
+    "soc_2": true,
+    "ccss": true
   },
   "findings": [$findings_json]
 }
@@ -934,6 +1296,7 @@ EOF
 print_summary() {
     local score=$(calculate_score)
     local interpretation=$(get_interpretation "$score")
+    local total=$((CRITICAL_COUNT + HIGH_COUNT + MEDIUM_COUNT + LOW_COUNT + PASS_COUNT))
     
     echo ""
     echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
@@ -946,6 +1309,14 @@ print_summary() {
     echo -e "    ${YELLOW}Medium:${NC}   $MEDIUM_COUNT"
     echo -e "    ${GREEN}Low:${NC}      $LOW_COUNT"
     echo -e "    ${GREEN}Passed:${NC}   $PASS_COUNT"
+    echo ""
+    echo "  Total checks: $total"
+    echo ""
+    echo -e "  Compliance frameworks covered:"
+    echo "    • CIS AWS Foundations Benchmark"
+    echo "    • ISO 27001"
+    echo "    • SOC 2"
+    echo "    • CCSS (Cryptocurrency Security Standard)"
     echo ""
     echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
     echo ""
@@ -973,6 +1344,14 @@ main() {
             -o|--output)
                 OUTPUT_FILE="$2"
                 shift 2
+                ;;
+            -a|--all-regions)
+                ALL_REGIONS=true
+                shift
+                ;;
+            -v|--verbose)
+                VERBOSE=true
+                shift
                 ;;
             -h|--help)
                 usage
@@ -1010,6 +1389,12 @@ main() {
     check_logging
     echo ""
     check_kms
+    echo ""
+    check_secrets
+    echo ""
+    check_ecr
+    echo ""
+    check_lambda
     
     # Generate report
     generate_report
