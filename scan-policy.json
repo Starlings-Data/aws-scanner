@@ -1,0 +1,50 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "StarlingsSecurityScanReadOnly",
+      "Effect": "Allow",
+      "Action": [
+        "iam:GetAccountSummary",
+        "iam:GetAccountPasswordPolicy",
+        "iam:ListUsers",
+        "iam:ListMFADevices",
+        "iam:ListAccessKeys",
+        "iam:GetAccessKeyLastUsed",
+        "iam:GetUser",
+        "iam:ListAttachedUserPolicies",
+        "iam:GenerateCredentialReport",
+        "iam:GetCredentialReport",
+        
+        "s3:ListAllMyBuckets",
+        "s3:GetBucketAcl",
+        "s3:GetBucketPolicy",
+        "s3:GetBucketEncryption",
+        "s3:GetBucketPublicAccessBlock",
+        "s3:GetBucketVersioning",
+        "s3:GetBucketLogging",
+        
+        "ec2:DescribeSecurityGroups",
+        "ec2:DescribeVolumes",
+        "ec2:DescribeInstances",
+        "ec2:DescribeVpcs",
+        
+        "rds:DescribeDBInstances",
+        
+        "cloudtrail:DescribeTrails",
+        "cloudtrail:GetTrailStatus",
+        
+        "guardduty:ListDetectors",
+        
+        "configservice:DescribeConfigurationRecorders",
+        
+        "securityhub:DescribeHub",
+        
+        "kms:ListKeys",
+        "kms:DescribeKey",
+        "kms:GetKeyRotationStatus"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
