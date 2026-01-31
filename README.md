@@ -60,19 +60,24 @@ aws sso login --profile my-sso-profile
 
 ## What It Checks
 
-The scanner runs **45+ read-only checks** across 9 security domains:
+The scanner runs **45+ read-only checks** across 14 security domains:
 
 | Domain | Checks | Examples |
 |--------|--------|----------|
 | IAM & Access | 8 | Root MFA, root access keys, password policy, user MFA, access key age, inactive users, admin policies, support role |
 | S3 Security | 5 | Public buckets, encryption, versioning, logging, SSL/TLS enforcement |
-| EC2 & Network | 9 | Open SSH/RDP, security groups, default SGs, EBS encryption, public IPs, IMDSv2, snapshot public access, VPC Flow Logs |
+| EC2 & Network | 10 | Open SSH/RDP, security groups, default SGs, EBS encryption, public IPs, IMDSv2, snapshot public access, VPC Flow Logs, default encryption |
 | RDS & Database | 4 | Public access, encryption, backup retention, deletion protection |
 | Logging & Monitoring | 8 | CloudTrail, multi-region trails, log validation, KMS encryption, GuardDuty, AWS Config, Security Hub, Access Analyzer |
+| CloudWatch | 3 | Log retention policies, CloudTrail integration, CIS security alarms |
 | KMS | 1 | Key rotation |
 | Secrets Manager | 1 | Secret rotation |
 | ECR | 1 | Image scanning |
 | Lambda | 1 | Deprecated runtimes |
+| Inspector | 1 | Vulnerability scanning enabled |
+| AWS Backup | 1 | Backup plans configured |
+| ACM | 1 | Certificate expiration |
+| SSM | 1 | Document public sharing |
 
 ## Compliance Framework Coverage
 
@@ -227,11 +232,21 @@ The scanner automatically redacts:
 - **LOG-007**: Security Hub - Verifies centralized findings
 - **LOG-008**: Access Analyzer - Checks external access analysis
 
+### CloudWatch (3 checks)
+- **CW-001**: Log retention - Identifies log groups without retention policies
+- **CW-002**: CloudTrail integration - Verifies CloudTrail sends to CloudWatch Logs
+- **CW-003**: CIS alarms - Checks for essential CIS security alarms
+
 ### Other Checks
 - **KMS-001**: Key rotation - Verifies automatic rotation
 - **SEC-001**: Secret rotation - Checks Secrets Manager rotation
 - **ECR-001**: Image scanning - Verifies scan on push
 - **LAM-001**: Runtime versions - Flags deprecated runtimes
+- **INS-001**: Inspector - Verifies vulnerability scanning enabled
+- **BAK-001**: Backup plans - Checks AWS Backup configuration
+- **ACM-001**: Certificate expiry - Flags certs expiring within 30 days
+- **EC2-010**: EBS default encryption - Verifies default encryption enabled
+- **SSM-001**: Document sharing - Checks for publicly shared documents
 
 ## Next Steps
 
@@ -247,6 +262,18 @@ The scanner automatically redacts:
 - ✅ **Auto-redacts** - Sensitive data removed from output
 
 ## Changelog
+
+### v1.2.0
+- Added 7 new check categories from real-world security audits
+- Added CloudWatch log retention check (CW-001)
+- Added CloudTrail to CloudWatch Logs integration check (CW-002)
+- Added CIS CloudWatch alarms check (CW-003)
+- Added Amazon Inspector vulnerability scanning check (INS-001)
+- Added AWS Backup plans check (BAK-001)
+- Added ACM certificate expiration check (ACM-001)
+- Added EBS default encryption check (EC2-010)
+- Added SSM document public sharing check (SSM-001)
+- Total checks now: 45+
 
 ### v1.1.1
 - Added `--profile` flag for AWS SSO and named profile support

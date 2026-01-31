@@ -32,7 +32,7 @@ export AWS_DEFAULT_OUTPUT=json
 # Configuration
 # ============================================================================
 
-SCANNER_VERSION="1.1.1"
+SCANNER_VERSION="1.2.0"
 DEFAULT_OUTPUT="aws-security-report.json"
 REGION=""
 OUTPUT_FILE=""
@@ -1226,6 +1226,256 @@ check_lambda() {
 }
 
 # ============================================================================
+# CloudWatch Log Checks
+# ============================================================================
+
+check_cloudwatch_logs() {
+    print_status "Checking CloudWatch Logs..."
+    local region=$(get_region)
+    
+    # Check 1: Log groups without retention
+    local log_groups=$(aws logs describe-log-groups $PROFILE_ARG --region "$region" \
+        --query 'logGroups[?retentionInDays==`null`].logGroupName' --output text 2>/dev/null || echo "")
+    
+    local no_retention_count=0
+    if [ -n "$log_groups" ]; then
+        no_retention_count=$(echo "$log_groups" | wc -w | tr -d ' ')
+    fi
+    
+    if [ "$no_retention_count" -gt 0 ]; then
+        add_finding "cloudwatch" "CW-001" "low" \
+            "CloudWatch log groups without retention" \
+            "$no_retention_count log group(s) have no retention policy (logs never expire)" \
+            "[]" \
+            "Set retention policies on log groups to control costs and comply with data retention requirements" \
+            "[\"CIS 3.1\",\"ISO27001 A.12.4.1\",\"SOC2 CC7.2\"]"
+        print_finding "low" "$no_retention_count log group(s) without retention"
+    else
+        add_pass
+        print_finding "pass" "All log groups have retention policies"
+    fi
+    
+    # Check 2: CloudTrail integration with CloudWatch Logs
+    local trail_name=$(aws cloudtrail describe-trails $PROFILE_ARG --region "$region" \
+        --query 'trailList[0].Name' --output text 2>/dev/null || echo "")
+    
+    if [ -n "$trail_name" ] && [ "$trail_name" != "None" ]; then
+        local cwl_arn=$(aws cloudtrail get-trail $PROFILE_ARG --name "$trail_name" \
+            --query 'Trail.CloudWatchLogsLogGroupArn' --output text 2>/dev/null || echo "")
+        
+        if [ -z "$cwl_arn" ] || [ "$cwl_arn" = "None" ]; then
+            add_finding "cloudwatch" "CW-002" "medium" \
+                "CloudTrail not integrated with CloudWatch Logs" \
+                "CloudTrail is not sending logs to CloudWatch Logs for real-time monitoring" \
+                "[]" \
+                "Configure CloudTrail to send logs to CloudWatch Logs for metric filters and alarms" \
+                "[\"CIS 3.4\",\"ISO27001 A.12.4.1\",\"SOC2 CC7.2\"]"
+            print_finding "medium" "CloudTrail not sending to CloudWatch Logs"
+        else
+            add_pass
+            print_finding "pass" "CloudTrail integrated with CloudWatch Logs"
+        fi
+    fi
+}
+
+# ============================================================================
+# CIS Alarms Check
+# ============================================================================
+
+check_cis_alarms() {
+    print_status "Checking CIS CloudWatch Alarms..."
+    local region=$(get_region)
+    
+    # Check for essential CIS alarms
+    local cis_alarms=(
+        "CIS-RootUserUsage"
+        "CIS-UnauthorizedAPICalls"
+        "CIS-ConsoleSignInWithoutMFA"
+        "CIS-IAMPolicyChanges"
+        "CIS-CloudTrailConfigChanges"
+        "CIS-SecurityGroupChanges"
+        "CIS-VPCChanges"
+    )
+    
+    local existing_alarms=$(aws cloudwatch describe-alarms $PROFILE_ARG --region "$region" \
+        --query 'MetricAlarms[].AlarmName' --output text 2>/dev/null || echo "")
+    
+    local missing_alarms=()
+    for alarm in "${cis_alarms[@]}"; do
+        if ! echo "$existing_alarms" | grep -q "$alarm"; then
+            missing_alarms+=("$alarm")
+        fi
+    done
+    
+    if [ ${#missing_alarms[@]} -gt 0 ]; then
+        add_finding "cloudwatch" "CW-003" "medium" \
+            "CIS CloudWatch alarms not configured" \
+            "${#missing_alarms[@]} of 7 essential CIS security alarms are missing" \
+            "[]" \
+            "Create CloudWatch metric filters and alarms for CIS benchmark security events" \
+            "[\"CIS 4.1-4.14\",\"ISO27001 A.12.4.1\",\"SOC2 CC7.2\"]"
+        print_finding "medium" "${#missing_alarms[@]} CIS alarm(s) missing"
+    else
+        add_pass
+        print_finding "pass" "CIS CloudWatch alarms configured"
+    fi
+}
+
+# ============================================================================
+# Amazon Inspector Check
+# ============================================================================
+
+check_inspector() {
+    print_status "Checking Amazon Inspector..."
+    local region=$(get_region)
+    
+    # Check if Inspector v2 is enabled
+    local inspector_status=$(aws inspector2 batch-get-account-status $PROFILE_ARG --region "$region" \
+        --query 'accounts[0].state.status' --output text 2>/dev/null || echo "")
+    
+    if [ "$inspector_status" != "ENABLED" ] && [ "$inspector_status" != "ENABLING" ]; then
+        add_finding "inspector" "INS-001" "medium" \
+            "Amazon Inspector not enabled" \
+            "Amazon Inspector v2 is not enabled for vulnerability scanning" \
+            "[]" \
+            "Enable Amazon Inspector for EC2, ECR, and Lambda vulnerability scanning" \
+            "[\"ISO27001 A.12.6.1\",\"SOC2 CC7.1\",\"CCSS 5.1\"]"
+        print_finding "medium" "Amazon Inspector not enabled"
+    else
+        add_pass
+        print_finding "pass" "Amazon Inspector is enabled"
+    fi
+}
+
+# ============================================================================
+# AWS Backup Check
+# ============================================================================
+
+check_backup() {
+    print_status "Checking AWS Backup..."
+    local region=$(get_region)
+    
+    # Check for backup plans
+    local backup_plans=$(aws backup list-backup-plans $PROFILE_ARG --region "$region" \
+        --query 'BackupPlansList[].BackupPlanName' --output text 2>/dev/null || echo "")
+    
+    if [ -z "$backup_plans" ]; then
+        add_finding "backup" "BAK-001" "medium" \
+            "No AWS Backup plans configured" \
+            "No backup plans are configured in this region for automated backups" \
+            "[]" \
+            "Create AWS Backup plans to automate backups of critical resources" \
+            "[\"ISO27001 A.17.1.1\",\"SOC2 CC9.1\",\"CCSS 7.1\"]"
+        print_finding "medium" "No AWS Backup plans found"
+    else
+        add_pass
+        print_finding "pass" "AWS Backup plans configured"
+    fi
+}
+
+# ============================================================================
+# ACM Certificate Check
+# ============================================================================
+
+check_acm() {
+    print_status "Checking ACM Certificates..."
+    local region=$(get_region)
+    
+    local certs=$(aws acm list-certificates $PROFILE_ARG --region "$region" \
+        --query 'CertificateSummaryList[*].[CertificateArn,DomainName]' --output text 2>/dev/null || echo "")
+    
+    if [ -z "$certs" ]; then
+        print_status "  No ACM certificates found"
+        return
+    fi
+    
+    local expiring_soon=()
+    local now=$(date +%s)
+    local thirty_days=$((30 * 24 * 60 * 60))
+    
+    while IFS=$'\t' read -r arn domain; do
+        local expires=$(aws acm describe-certificate $PROFILE_ARG --region "$region" \
+            --certificate-arn "$arn" \
+            --query 'Certificate.NotAfter' --output text 2>/dev/null || echo "")
+        
+        if [ -n "$expires" ] && [ "$expires" != "None" ]; then
+            local expires_epoch=$(date -j -f "%Y-%m-%dT%H:%M:%S" "${expires%+*}" +%s 2>/dev/null || \
+                                  date -d "$expires" +%s 2>/dev/null || echo "0")
+            local diff=$((expires_epoch - now))
+            
+            if [ "$diff" -lt "$thirty_days" ] && [ "$diff" -gt 0 ]; then
+                expiring_soon+=("$domain")
+            fi
+        fi
+    done <<< "$certs"
+    
+    if [ ${#expiring_soon[@]} -gt 0 ]; then
+        add_finding "acm" "ACM-001" "high" \
+            "ACM certificates expiring soon" \
+            "${#expiring_soon[@]} certificate(s) will expire within 30 days" \
+            "[]" \
+            "Renew or replace expiring certificates before they expire" \
+            "[\"ISO27001 A.10.1.2\",\"SOC2 CC6.1\"]"
+        print_finding "high" "${#expiring_soon[@]} certificate(s) expiring within 30 days"
+    else
+        add_pass
+        print_finding "pass" "No certificates expiring within 30 days"
+    fi
+}
+
+# ============================================================================
+# EBS Default Encryption Check
+# ============================================================================
+
+check_ebs_default_encryption() {
+    print_status "Checking EBS Default Encryption..."
+    local region=$(get_region)
+    
+    local default_encryption=$(aws ec2 get-ebs-encryption-by-default $PROFILE_ARG --region "$region" \
+        --query 'EbsEncryptionByDefault' --output text 2>/dev/null || echo "")
+    
+    if [ "$default_encryption" != "True" ]; then
+        add_finding "ec2" "EC2-010" "medium" \
+            "EBS default encryption not enabled" \
+            "Default EBS encryption is not enabled for new volumes in this region" \
+            "[]" \
+            "Enable EBS encryption by default to ensure all new volumes are encrypted" \
+            "[\"CIS 2.2.1\",\"ISO27001 A.10.1.1\",\"SOC2 CC6.1\",\"CCSS 4.2\"]"
+        print_finding "medium" "EBS default encryption not enabled"
+    else
+        add_pass
+        print_finding "pass" "EBS default encryption is enabled"
+    fi
+}
+
+# ============================================================================
+# SSM Public Sharing Block Check
+# ============================================================================
+
+check_ssm_sharing() {
+    print_status "Checking SSM Document Sharing..."
+    local region=$(get_region)
+    
+    local public_docs=$(aws ssm list-documents $PROFILE_ARG --region "$region" \
+        --filters "Key=Owner,Values=Self" \
+        --query 'DocumentIdentifiers[?contains(Permissions,`All`)].Name' --output text 2>/dev/null || echo "")
+    
+    if [ -n "$public_docs" ]; then
+        local doc_count=$(echo "$public_docs" | wc -w | tr -d ' ')
+        add_finding "ssm" "SSM-001" "high" \
+            "SSM documents shared publicly" \
+            "$doc_count SSM document(s) are shared publicly" \
+            "[]" \
+            "Remove public sharing from SSM documents or enable account-level block" \
+            "[\"CIS 2.3.3\",\"ISO27001 A.9.4.1\",\"SOC2 CC6.1\"]"
+        print_finding "high" "$doc_count SSM document(s) shared publicly"
+    else
+        add_pass
+        print_finding "pass" "No publicly shared SSM documents"
+    fi
+}
+
+# ============================================================================
 # Report Generation
 # ============================================================================
 
@@ -1431,6 +1681,13 @@ main() {
     check_ecr
     echo ""
     check_lambda
+    check_cloudwatch_logs
+    check_cis_alarms
+    check_inspector
+    check_backup
+    check_acm
+    check_ebs_default_encryption
+    check_ssm_sharing
     
     # Generate report
     generate_report
