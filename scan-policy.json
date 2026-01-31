@@ -61,6 +61,22 @@
         
         "access-analyzer:ListAnalyzers",
         
+        "logs:DescribeLogGroups",
+        
+        "cloudwatch:DescribeAlarms",
+        
+        "inspector2:BatchGetAccountStatus",
+        
+        "backup:ListBackupPlans",
+        
+        "acm:ListCertificates",
+        "acm:DescribeCertificate",
+        
+        "ec2:GetEbsEncryptionByDefault",
+        
+        "ssm:DescribeDocument",
+        "ssm:ListDocuments",
+        
         "sts:GetCallerIdentity"
       ],
       "Resource": "*"
