@@ -25,14 +25,19 @@
 
 set -e
 
+# Force JSON output regardless of user's AWS CLI config
+export AWS_DEFAULT_OUTPUT=json
+
 # ============================================================================
 # Configuration
 # ============================================================================
 
-SCANNER_VERSION="1.1.0"
+SCANNER_VERSION="1.1.1"
 DEFAULT_OUTPUT="aws-security-report.json"
 REGION=""
 OUTPUT_FILE=""
+PROFILE=""
+PROFILE_ARG=""
 ALL_REGIONS=false
 VERBOSE=false
 
@@ -91,6 +96,7 @@ usage() {
     echo "Usage: $0 [OPTIONS]"
     echo ""
     echo "Options:"
+    echo "  -p, --profile PROFILE  AWS CLI profile to use (for SSO or named profiles)"
     echo "  -r, --region REGION    AWS region to scan (default: from AWS CLI config)"
     echo "  -o, --output FILE      Output file (default: ${DEFAULT_OUTPUT})"
     echo "  -a, --all-regions      Scan all available regions"
@@ -98,10 +104,11 @@ usage() {
     echo "  -h, --help             Show this help message"
     echo ""
     echo "Examples:"
-    echo "  $0                           # Scan default region"
-    echo "  $0 --region us-east-1        # Scan specific region"
-    echo "  $0 --all-regions             # Scan all regions"
-    echo "  $0 --output my-report.json   # Custom output file"
+    echo "  $0                              # Scan with default credentials"
+    echo "  $0 --profile my-sso-profile     # Scan using SSO profile"
+    echo "  $0 --region us-east-1           # Scan specific region"
+    echo "  $0 --all-regions                # Scan all regions"
+    echo "  $0 --output my-report.json      # Custom output file"
     echo ""
 }
 
@@ -116,16 +123,37 @@ check_prerequisites() {
     fi
     print_success "AWS CLI found"
     
-    # Check AWS credentials
-    if ! aws sts get-caller-identity &> /dev/null; then
+    # Set up profile argument if specified
+    if [ -n "$PROFILE" ]; then
+        PROFILE_ARG="--profile $PROFILE"
+        print_status "Using profile: $PROFILE"
+    fi
+    
+    # Check AWS credentials with better error handling
+    local cred_check
+    cred_check=$(aws sts get-caller-identity $PROFILE_ARG 2>&1)
+    local cred_exit=$?
+    
+    if [ $cred_exit -ne 0 ]; then
         print_error "AWS credentials not configured or invalid."
-        echo "  Run: aws configure"
+        # Show helpful hints based on the error
+        if echo "$cred_check" | grep -q "InvalidClientTokenId"; then
+            echo "  Access keys are invalid or expired."
+            echo "  Run: aws configure"
+            echo "  Or use SSO: aws sso login --profile YOUR_PROFILE"
+        elif echo "$cred_check" | grep -q "ExpiredToken"; then
+            echo "  Session expired. Run: aws sso login"
+        elif echo "$cred_check" | grep -q "could not be found"; then
+            echo "  Profile '$PROFILE' not found in ~/.aws/config"
+        else
+            echo "  $cred_check"
+        fi
         exit 1
     fi
     print_success "AWS credentials valid"
     
     # Get account ID for reference
-    ACCOUNT_ID=$(aws sts get-caller-identity --query 'Account' --output text 2>/dev/null || echo "unknown")
+    ACCOUNT_ID=$(aws sts get-caller-identity $PROFILE_ARG --query 'Account' --output text 2>/dev/null || echo "unknown")
     print_status "Account ID: $ACCOUNT_ID"
     
     # Check jq
@@ -142,12 +170,12 @@ get_region() {
     if [ -n "$REGION" ]; then
         echo "$REGION"
     else
-        aws configure get region 2>/dev/null || echo "us-east-1"
+        aws configure get region $PROFILE_ARG 2>/dev/null || echo "us-east-1"
     fi
 }
 
 get_all_regions() {
-    aws ec2 describe-regions --query 'Regions[].RegionName' --output text 2>/dev/null || echo "us-east-1"
+    aws ec2 describe-regions $PROFILE_ARG --query 'Regions[].RegionName' --output text 2>/dev/null || echo "us-east-1"
 }
 
 # ============================================================================
@@ -172,10 +200,10 @@ add_finding() {
     local frameworks=$8  # New: compliance framework references
     
     case $severity in
-        critical) ((CRITICAL_COUNT++)) ;;
-        high)     ((HIGH_COUNT++)) ;;
-        medium)   ((MEDIUM_COUNT++)) ;;
-        low)      ((LOW_COUNT++)) ;;
+        critical) CRITICAL_COUNT=$((CRITICAL_COUNT + 1)) ;;
+        high)     HIGH_COUNT=$((HIGH_COUNT + 1)) ;;
+        medium)   MEDIUM_COUNT=$((MEDIUM_COUNT + 1)) ;;
+        low)      LOW_COUNT=$((LOW_COUNT + 1)) ;;
     esac
     
     # Escape quotes in strings for JSON
@@ -191,7 +219,7 @@ add_finding() {
 }
 
 add_pass() {
-    ((PASS_COUNT++))
+    PASS_COUNT=$((PASS_COUNT + 1))
 }
 
 # ============================================================================
@@ -204,8 +232,8 @@ check_iam() {
     
     # Check 1: Root account MFA
     print_status "  Checking root account MFA..."
-    local account_summary=$(aws iam get-account-summary --query 'SummaryMap' 2>/dev/null || echo "{}")
-    local root_mfa=$(echo "$account_summary" | grep -o '"AccountMFAEnabled":[0-9]*' | cut -d: -f2)
+    local account_summary=$(aws iam get-account-summary $PROFILE_ARG --output json 2>/dev/null || echo "{}")
+    local root_mfa=$(echo "$account_summary" | grep -o '"AccountMFAEnabled": *[0-9]*' | grep -o '[0-9]*$' || echo "")
     
     if [ "$root_mfa" = "0" ] || [ -z "$root_mfa" ]; then
         add_finding "iam" "IAM-001" "critical" \
@@ -222,7 +250,7 @@ check_iam() {
     
     # Check 2: Root access keys (should not exist)
     print_status "  Checking root access keys..."
-    local root_access_keys=$(echo "$account_summary" | grep -o '"AccountAccessKeysPresent":[0-9]*' | cut -d: -f2)
+    local root_access_keys=$(echo "$account_summary" | grep -o '"AccountAccessKeysPresent": *[0-9]*' | grep -o '[0-9]*$' || echo "0")
     
     if [ "$root_access_keys" = "1" ]; then
         add_finding "iam" "IAM-002" "critical" \
@@ -239,7 +267,7 @@ check_iam() {
     
     # Check 3: Password policy
     print_status "  Checking password policy..."
-    local password_policy=$(aws iam get-account-password-policy 2>/dev/null || echo "")
+    local password_policy=$(aws iam get-account-password-policy $PROFILE_ARG --output json 2>/dev/null || echo "")
     
     if [ -z "$password_policy" ]; then
         add_finding "iam" "IAM-003" "high" \
@@ -250,11 +278,11 @@ check_iam() {
             "[\"CIS 1.8\",\"ISO27001 A.9.4.3\",\"SOC2 CC6.1\",\"CCSS 4.2\"]"
         print_finding "high" "No password policy configured"
     else
-        local min_length=$(echo "$password_policy" | grep -o '"MinimumPasswordLength":[0-9]*' | cut -d: -f2)
-        local require_symbols=$(echo "$password_policy" | grep -o '"RequireSymbols":[a-z]*' | cut -d: -f2)
-        local require_numbers=$(echo "$password_policy" | grep -o '"RequireNumbers":[a-z]*' | cut -d: -f2)
-        local require_uppercase=$(echo "$password_policy" | grep -o '"RequireUppercaseCharacters":[a-z]*' | cut -d: -f2)
-        local max_age=$(echo "$password_policy" | grep -o '"MaxPasswordAge":[0-9]*' | cut -d: -f2)
+        local min_length=$(echo "$password_policy" | grep -o '"MinimumPasswordLength": *[0-9]*' | grep -o '[0-9]*$' || echo "")
+        local require_symbols=$(echo "$password_policy" | grep -o '"RequireSymbols": *[a-z]*' | grep -o '[a-z]*$' || echo "")
+        local require_numbers=$(echo "$password_policy" | grep -o '"RequireNumbers": *[a-z]*' | grep -o '[a-z]*$' || echo "")
+        local require_uppercase=$(echo "$password_policy" | grep -o '"RequireUppercaseCharacters": *[a-z]*' | grep -o '[a-z]*$' || echo "")
+        local max_age=$(echo "$password_policy" | grep -o '"MaxPasswordAge": *[0-9]*' | grep -o '[0-9]*$' || echo "")
         
         local policy_issues=()
         
@@ -290,11 +318,11 @@ check_iam() {
     
     # Check 4: Users without MFA
     print_status "  Checking user MFA status..."
-    local users=$(aws iam list-users --query 'Users[*].UserName' --output text 2>/dev/null || echo "")
+    local users=$(aws iam list-users $PROFILE_ARG --query 'Users[*].UserName' --output text 2>/dev/null || echo "")
     local users_without_mfa=()
     
     for user in $users; do
-        local mfa_devices=$(aws iam list-mfa-devices --user-name "$user" --query 'MFADevices' --output text 2>/dev/null || echo "")
+        local mfa_devices=$(aws iam list-mfa-devices $PROFILE_ARG --user-name "$user" --query 'MFADevices' --output text 2>/dev/null || echo "")
         if [ -z "$mfa_devices" ]; then
             users_without_mfa+=("$user")
         fi
@@ -321,7 +349,7 @@ check_iam() {
     
     if [ -n "$ninety_days_ago" ]; then
         for user in $users; do
-            local keys=$(aws iam list-access-keys --user-name "$user" --query "AccessKeyMetadata[?CreateDate<='${ninety_days_ago}'].AccessKeyId" --output text 2>/dev/null || echo "")
+            local keys=$(aws iam list-access-keys $PROFILE_ARG --user-name "$user" --query "AccessKeyMetadata[?CreateDate<='${ninety_days_ago}'].AccessKeyId" --output text 2>/dev/null || echo "")
             for key in $keys; do
                 old_keys+=("$user:$key")
             done
@@ -343,9 +371,9 @@ check_iam() {
     
     # Check 6: Unused credentials
     print_status "  Checking for unused credentials..."
-    aws iam generate-credential-report &>/dev/null || true
+    aws iam generate-credential-report $PROFILE_ARG &>/dev/null || true
     sleep 2
-    local cred_report=$(aws iam get-credential-report --query 'Content' --output text 2>/dev/null | base64 -d 2>/dev/null || echo "")
+    local cred_report=$(aws iam get-credential-report $PROFILE_ARG --query 'Content' --output text 2>/dev/null | base64 -d 2>/dev/null || echo "")
     
     if [ -n "$cred_report" ] && [ -n "$ninety_days_ago" ]; then
         local inactive_count=$(echo "$cred_report" | awk -F, 'NR>1 && $5!="N/A" && $5!="no_information" {
@@ -372,7 +400,7 @@ check_iam() {
     local admin_users=()
     
     for user in $users; do
-        local attached=$(aws iam list-attached-user-policies --user-name "$user" --query "AttachedPolicies[?PolicyName=='AdministratorAccess'].PolicyName" --output text 2>/dev/null || echo "")
+        local attached=$(aws iam list-attached-user-policies $PROFILE_ARG --user-name "$user" --query "AttachedPolicies[?PolicyName=='AdministratorAccess'].PolicyName" --output text 2>/dev/null || echo "")
         if [ -n "$attached" ]; then
             admin_users+=("$user")
         fi
@@ -394,7 +422,7 @@ check_iam() {
     
     # Check 8: AWS Support Role exists
     print_status "  Checking AWS Support role..."
-    local support_role=$(aws iam get-role --role-name AWSSupportAccess 2>/dev/null || echo "")
+    local support_role=$(aws iam get-role $PROFILE_ARG --role-name AWSSupportAccess 2>/dev/null || echo "")
     
     if [ -z "$support_role" ]; then
         add_finding "iam" "IAM-008" "low" \
@@ -418,7 +446,7 @@ check_s3() {
     print_status "Checking S3 Bucket Security..."
     
     # Get all buckets
-    local buckets=$(aws s3api list-buckets --query 'Buckets[*].Name' --output text 2>/dev/null || echo "")
+    local buckets=$(aws s3api list-buckets $PROFILE_ARG --query 'Buckets[*].Name' --output text 2>/dev/null || echo "")
     
     if [ -z "$buckets" ]; then
         print_warning "  No S3 buckets found or unable to list buckets"
@@ -436,8 +464,8 @@ check_s3() {
         ((bucket_count++))
         
         # Check 1: Public access
-        local public_access=$(aws s3api get-public-access-block --bucket "$bucket" 2>/dev/null || echo "")
-        local bucket_acl=$(aws s3api get-bucket-acl --bucket "$bucket" --query 'Grants[?Grantee.URI==`http://acs.amazonaws.com/groups/global/AllUsers` || Grantee.URI==`http://acs.amazonaws.com/groups/global/AuthenticatedUsers`]' --output text 2>/dev/null || echo "")
+        local public_access=$(aws s3api get-public-access-block $PROFILE_ARG --bucket "$bucket" 2>/dev/null || echo "")
+        local bucket_acl=$(aws s3api get-bucket-acl $PROFILE_ARG --bucket "$bucket" --query 'Grants[?Grantee.URI==`http://acs.amazonaws.com/groups/global/AllUsers` || Grantee.URI==`http://acs.amazonaws.com/groups/global/AuthenticatedUsers`]' --output text 2>/dev/null || echo "")
         
         if [ -z "$public_access" ] || [ -n "$bucket_acl" ]; then
             local is_public=false
@@ -460,25 +488,25 @@ check_s3() {
         fi
         
         # Check 2: Encryption
-        local encryption=$(aws s3api get-bucket-encryption --bucket "$bucket" 2>/dev/null || echo "")
+        local encryption=$(aws s3api get-bucket-encryption $PROFILE_ARG --bucket "$bucket" 2>/dev/null || echo "")
         if [ -z "$encryption" ]; then
             unencrypted_buckets+=("$bucket")
         fi
         
         # Check 3: Logging
-        local logging=$(aws s3api get-bucket-logging --bucket "$bucket" --query 'LoggingEnabled' --output text 2>/dev/null || echo "")
+        local logging=$(aws s3api get-bucket-logging $PROFILE_ARG --bucket "$bucket" --query 'LoggingEnabled' --output text 2>/dev/null || echo "")
         if [ -z "$logging" ] || [ "$logging" = "None" ]; then
             no_logging_buckets+=("$bucket")
         fi
         
         # Check 4: Versioning
-        local versioning=$(aws s3api get-bucket-versioning --bucket "$bucket" --query 'Status' --output text 2>/dev/null || echo "")
+        local versioning=$(aws s3api get-bucket-versioning $PROFILE_ARG --bucket "$bucket" --query 'Status' --output text 2>/dev/null || echo "")
         if [ -z "$versioning" ] || [ "$versioning" = "None" ] || [ "$versioning" = "Suspended" ]; then
             no_versioning_buckets+=("$bucket")
         fi
         
         # Check 5: SSL/TLS enforcement (bucket policy requiring SecureTransport)
-        local bucket_policy=$(aws s3api get-bucket-policy --bucket "$bucket" --query 'Policy' --output text 2>/dev/null || echo "")
+        local bucket_policy=$(aws s3api get-bucket-policy $PROFILE_ARG --bucket "$bucket" --query 'Policy' --output text 2>/dev/null || echo "")
         if [ -n "$bucket_policy" ]; then
             if ! echo "$bucket_policy" | grep -q "aws:SecureTransport"; then
                 no_ssl_buckets+=("$bucket")
@@ -568,7 +596,7 @@ check_ec2() {
     local region=$(get_region)
     
     # Get all security groups
-    local sgs=$(aws ec2 describe-security-groups --region "$region" --query 'SecurityGroups[*].[GroupId,GroupName]' --output text 2>/dev/null || echo "")
+    local sgs=$(aws ec2 describe-security-groups $PROFILE_ARG --region "$region" --query 'SecurityGroups[*].[GroupId,GroupName]' --output text 2>/dev/null || echo "")
     
     if [ -z "$sgs" ]; then
         print_warning "  No security groups found or unable to list"
@@ -583,7 +611,7 @@ check_ec2() {
     # Check each security group
     while IFS=$'\t' read -r sg_id sg_name; do
         # Check for 0.0.0.0/0 on SSH (22)
-        local ssh_open=$(aws ec2 describe-security-groups --region "$region" --group-ids "$sg_id" \
+        local ssh_open=$(aws ec2 describe-security-groups $PROFILE_ARG --region "$region" --group-ids "$sg_id" \
             --query "SecurityGroups[*].IpPermissions[?FromPort==\`22\` && ToPort==\`22\`].IpRanges[?CidrIp==\`0.0.0.0/0\`]" \
             --output text 2>/dev/null || echo "")
         if [ -n "$ssh_open" ]; then
@@ -591,7 +619,7 @@ check_ec2() {
         fi
         
         # Check for 0.0.0.0/0 on RDP (3389)
-        local rdp_open=$(aws ec2 describe-security-groups --region "$region" --group-ids "$sg_id" \
+        local rdp_open=$(aws ec2 describe-security-groups $PROFILE_ARG --region "$region" --group-ids "$sg_id" \
             --query "SecurityGroups[*].IpPermissions[?FromPort==\`3389\` && ToPort==\`3389\`].IpRanges[?CidrIp==\`0.0.0.0/0\`]" \
             --output text 2>/dev/null || echo "")
         if [ -n "$rdp_open" ]; then
@@ -599,7 +627,7 @@ check_ec2() {
         fi
         
         # Check for 0.0.0.0/0 on all ports
-        local all_open=$(aws ec2 describe-security-groups --region "$region" --group-ids "$sg_id" \
+        local all_open=$(aws ec2 describe-security-groups $PROFILE_ARG --region "$region" --group-ids "$sg_id" \
             --query "SecurityGroups[*].IpPermissions[?FromPort==\`-1\` || (FromPort==\`0\` && ToPort==\`65535\`)].IpRanges[?CidrIp==\`0.0.0.0/0\`]" \
             --output text 2>/dev/null || echo "")
         if [ -n "$all_open" ]; then
@@ -608,9 +636,9 @@ check_ec2() {
         
         # Check default security groups (should have no rules)
         if [ "$sg_name" = "default" ]; then
-            local inbound_rules=$(aws ec2 describe-security-groups --region "$region" --group-ids "$sg_id" \
+            local inbound_rules=$(aws ec2 describe-security-groups $PROFILE_ARG --region "$region" --group-ids "$sg_id" \
                 --query "SecurityGroups[*].IpPermissions" --output text 2>/dev/null || echo "")
-            local outbound_rules=$(aws ec2 describe-security-groups --region "$region" --group-ids "$sg_id" \
+            local outbound_rules=$(aws ec2 describe-security-groups $PROFILE_ARG --region "$region" --group-ids "$sg_id" \
                 --query "SecurityGroups[*].IpPermissionsEgress[?!(IpProtocol==\`-1\` && IpRanges[?CidrIp==\`0.0.0.0/0\`])]" \
                 --output text 2>/dev/null || echo "")
             if [ -n "$inbound_rules" ]; then
@@ -677,7 +705,7 @@ check_ec2() {
     
     # Check for unencrypted EBS volumes
     print_status "  Checking EBS encryption..."
-    local unencrypted_volumes=$(aws ec2 describe-volumes --region "$region" \
+    local unencrypted_volumes=$(aws ec2 describe-volumes $PROFILE_ARG --region "$region" \
         --query "Volumes[?Encrypted==\`false\`].VolumeId" --output text 2>/dev/null || echo "")
     local unencrypted_count=$(echo "$unencrypted_volumes" | wc -w | tr -d ' ')
     
@@ -696,7 +724,7 @@ check_ec2() {
     
     # Check for instances with public IPs
     print_status "  Checking public IP exposure..."
-    local public_instances=$(aws ec2 describe-instances --region "$region" \
+    local public_instances=$(aws ec2 describe-instances $PROFILE_ARG --region "$region" \
         --query "Reservations[*].Instances[?PublicIpAddress!=null].InstanceId" --output text 2>/dev/null || echo "")
     local public_count=$(echo "$public_instances" | wc -w | tr -d ' ')
     
@@ -715,7 +743,7 @@ check_ec2() {
     
     # Check for IMDSv1 (vulnerable to SSRF)
     print_status "  Checking IMDS configuration..."
-    local imdsv1_instances=$(aws ec2 describe-instances --region "$region" \
+    local imdsv1_instances=$(aws ec2 describe-instances $PROFILE_ARG --region "$region" \
         --query "Reservations[*].Instances[?MetadataOptions.HttpTokens!='required'].InstanceId" --output text 2>/dev/null || echo "")
     local imdsv1_count=$(echo "$imdsv1_instances" | wc -w | tr -d ' ')
     
@@ -734,7 +762,7 @@ check_ec2() {
     
     # Check EBS snapshot public access blocking
     print_status "  Checking EBS snapshot public access block..."
-    local snapshot_block=$(aws ec2 get-snapshot-block-public-access-state --region "$region" \
+    local snapshot_block=$(aws ec2 get-snapshot-block-public-access-state $PROFILE_ARG --region "$region" \
         --query 'State' --output text 2>/dev/null || echo "")
     
     if [ "$snapshot_block" != "block-all-sharing" ]; then
@@ -752,11 +780,11 @@ check_ec2() {
     
     # Check VPC Flow Logs
     print_status "  Checking VPC Flow Logs..."
-    local vpcs=$(aws ec2 describe-vpcs --region "$region" --query 'Vpcs[*].VpcId' --output text 2>/dev/null || echo "")
+    local vpcs=$(aws ec2 describe-vpcs $PROFILE_ARG --region "$region" --query 'Vpcs[*].VpcId' --output text 2>/dev/null || echo "")
     local vpcs_without_flow_logs=()
     
     for vpc in $vpcs; do
-        local flow_logs=$(aws ec2 describe-flow-logs --region "$region" \
+        local flow_logs=$(aws ec2 describe-flow-logs $PROFILE_ARG --region "$region" \
             --filter "Name=resource-id,Values=$vpc" --query 'FlowLogs[0].FlowLogId' --output text 2>/dev/null || echo "")
         if [ -z "$flow_logs" ] || [ "$flow_logs" = "None" ]; then
             vpcs_without_flow_logs+=("$vpc")
@@ -786,7 +814,7 @@ check_rds() {
     local region=$(get_region)
     
     # Get all RDS instances
-    local instances=$(aws rds describe-db-instances --region "$region" \
+    local instances=$(aws rds describe-db-instances $PROFILE_ARG --region "$region" \
         --query 'DBInstances[*].DBInstanceIdentifier' --output text 2>/dev/null || echo "")
     
     if [ -z "$instances" ]; then
@@ -800,7 +828,7 @@ check_rds() {
     local no_deletion_protection=()
     
     for instance in $instances; do
-        local details=$(aws rds describe-db-instances --region "$region" \
+        local details=$(aws rds describe-db-instances $PROFILE_ARG --region "$region" \
             --db-instance-identifier "$instance" \
             --query 'DBInstances[0].[PubliclyAccessible,StorageEncrypted,BackupRetentionPeriod,DeletionProtection]' \
             --output text 2>/dev/null || echo "")
@@ -894,7 +922,7 @@ check_logging() {
     
     # Check 1: CloudTrail enabled
     print_status "  Checking CloudTrail..."
-    local trails=$(aws cloudtrail describe-trails --region "$region" \
+    local trails=$(aws cloudtrail describe-trails $PROFILE_ARG --region "$region" \
         --query 'trailList[*].Name' --output text 2>/dev/null || echo "")
     
     if [ -z "$trails" ]; then
@@ -911,7 +939,7 @@ check_logging() {
         
         # Check trail configuration
         for trail in $trails; do
-            local trail_config=$(aws cloudtrail describe-trails --region "$region" \
+            local trail_config=$(aws cloudtrail describe-trails $PROFILE_ARG --region "$region" \
                 --trail-name-list "$trail" \
                 --query 'trailList[0].[IsMultiRegionTrail,LogFileValidationEnabled,KMSKeyId]' \
                 --output text 2>/dev/null || echo "")
@@ -960,7 +988,7 @@ check_logging() {
     
     # Check 2: GuardDuty enabled
     print_status "  Checking GuardDuty..."
-    local guardduty=$(aws guardduty list-detectors --region "$region" \
+    local guardduty=$(aws guardduty list-detectors $PROFILE_ARG --region "$region" \
         --query 'DetectorIds' --output text 2>/dev/null || echo "")
     
     if [ -z "$guardduty" ]; then
@@ -978,7 +1006,7 @@ check_logging() {
     
     # Check 3: AWS Config enabled
     print_status "  Checking AWS Config..."
-    local config_recorders=$(aws configservice describe-configuration-recorders --region "$region" \
+    local config_recorders=$(aws configservice describe-configuration-recorders $PROFILE_ARG --region "$region" \
         --query 'ConfigurationRecorders[*].name' --output text 2>/dev/null || echo "")
     
     if [ -z "$config_recorders" ]; then
@@ -996,7 +1024,7 @@ check_logging() {
     
     # Check 4: Security Hub enabled
     print_status "  Checking Security Hub..."
-    local security_hub=$(aws securityhub describe-hub --region "$region" 2>/dev/null || echo "")
+    local security_hub=$(aws securityhub describe-hub $PROFILE_ARG --region "$region" 2>/dev/null || echo "")
     
     if [ -z "$security_hub" ]; then
         add_finding "logging" "LOG-007" "medium" \
@@ -1013,7 +1041,7 @@ check_logging() {
     
     # Check 5: Access Analyzer
     print_status "  Checking IAM Access Analyzer..."
-    local analyzer=$(aws accessanalyzer list-analyzers --region "$region" \
+    local analyzer=$(aws accessanalyzer list-analyzers $PROFILE_ARG --region "$region" \
         --query 'analyzers[?type==`EXTERNAL`].arn' --output text 2>/dev/null || echo "")
     
     if [ -z "$analyzer" ]; then
@@ -1039,7 +1067,7 @@ check_kms() {
     local region=$(get_region)
     
     # Get customer managed keys
-    local keys=$(aws kms list-keys --region "$region" \
+    local keys=$(aws kms list-keys $PROFILE_ARG --region "$region" \
         --query 'Keys[*].KeyId' --output text 2>/dev/null || echo "")
     
     if [ -z "$keys" ]; then
@@ -1051,11 +1079,11 @@ check_kms() {
     
     for key in $keys; do
         # Check if it's customer managed (not AWS managed)
-        local key_manager=$(aws kms describe-key --region "$region" --key-id "$key" \
+        local key_manager=$(aws kms describe-key $PROFILE_ARG --region "$region" --key-id "$key" \
             --query 'KeyMetadata.KeyManager' --output text 2>/dev/null || echo "")
         
         if [ "$key_manager" = "CUSTOMER" ]; then
-            local rotation=$(aws kms get-key-rotation-status --region "$region" --key-id "$key" \
+            local rotation=$(aws kms get-key-rotation-status $PROFILE_ARG --region "$region" --key-id "$key" \
                 --query 'KeyRotationEnabled' --output text 2>/dev/null || echo "")
             
             if [ "$rotation" = "False" ]; then
@@ -1086,7 +1114,7 @@ check_secrets() {
     print_status "Checking Secrets Manager..."
     local region=$(get_region)
     
-    local secrets=$(aws secretsmanager list-secrets --region "$region" \
+    local secrets=$(aws secretsmanager list-secrets $PROFILE_ARG --region "$region" \
         --query 'SecretList[*].[Name,RotationEnabled]' --output text 2>/dev/null || echo "")
     
     if [ -z "$secrets" ]; then
@@ -1124,7 +1152,7 @@ check_ecr() {
     print_status "Checking ECR Container Registry..."
     local region=$(get_region)
     
-    local repos=$(aws ecr describe-repositories --region "$region" \
+    local repos=$(aws ecr describe-repositories $PROFILE_ARG --region "$region" \
         --query 'repositories[*].[repositoryName,imageScanningConfiguration.scanOnPush]' \
         --output text 2>/dev/null || echo "")
     
@@ -1163,7 +1191,7 @@ check_lambda() {
     print_status "Checking Lambda Functions..."
     local region=$(get_region)
     
-    local functions=$(aws lambda list-functions --region "$region" \
+    local functions=$(aws lambda list-functions $PROFILE_ARG --region "$region" \
         --query 'Functions[*].[FunctionName,VpcConfig.VpcId,Runtime]' \
         --output text 2>/dev/null || echo "")
     
@@ -1322,9 +1350,13 @@ print_summary() {
     echo ""
     echo -e "  Report saved to: ${GREEN}$OUTPUT_FILE${NC}"
     echo ""
+    echo "  View results:"
+    echo "    cat $OUTPUT_FILE | jq '.'"
+    echo "    cat $OUTPUT_FILE | jq '.findings[]'"
+    echo ""
     echo "  Next steps:"
     echo "    1. Review the report for sensitive information"
-    echo "    2. Share it at: https://scamshield.app/audit"
+    echo "    2. Share at: https://scamshield.app/audit"
     echo "    3. Get your personalized remediation plan"
     echo ""
 }
@@ -1337,6 +1369,10 @@ main() {
     # Parse arguments
     while [[ $# -gt 0 ]]; do
         case $1 in
+            -p|--profile)
+                PROFILE="$2"
+                shift 2
+                ;;
             -r|--region)
                 REGION="$2"
                 shift 2
